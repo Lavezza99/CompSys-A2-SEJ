@@ -26,6 +26,33 @@ typedef struct {
   const char *needle;
 } worker_arg_t;
 
+// Function to search a file for the needle (similar to fauxgrep_file but for threads)
+void search_file(const char *needle, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        pthread_mutex_lock(&stdout_mutex);
+        warn("failed to open %s", path);
+        pthread_mutex_unlock(&stdout_mutex);
+        return;
+    }
+
+    char *line = NULL;
+    size_t linelen = 0;
+    int lineno = 1;
+
+    while (getline(&line, &linelen, f) != -1) {
+        if (strstr(line, needle) != NULL) {
+            pthread_mutex_lock(&stdout_mutex);
+            printf("%s:%d: %s", path, lineno, line);
+            pthread_mutex_unlock(&stdout_mutex);
+        }
+        lineno++;
+    }
+
+    free(line);
+    fclose(f);
+}
+
 static void* worker(void *arg) {
   worker_arg_t *wa = (worker_arg_t*)arg;
 
@@ -36,30 +63,10 @@ static void* worker(void *arg) {
       break;
     }
 
-    FILE *f = fopen(path, "r");
-    if (!f) {
-      assert(pthread_mutex_lock(&stdout_mutex) == 0);
-      fprintf(stderr, "fauxgrep-mt: cannot open %s\n", path);
-      assert(pthread_mutex_unlock(&stdout_mutex) == 0);
-      free(path);
-      continue;
-    }
-
-    char *line = NULL;
-    size_t cap = 0;
-    ssize_t n;
-    while ((n = getline(&line, &cap, f)) != -1) {
-      if (strstr(line, wa->needle) != NULL) {
-        assert(pthread_mutex_lock(&stdout_mutex) == 0);
-        // Print like: file:line
-        fputs(path, stdout);
-        fputc(':', stdout);
-        fputs(line, stdout);
-        assert(pthread_mutex_unlock(&stdout_mutex) == 0);
-      }
-    }
-    free(line);
-    fclose(f);
+    // Search the file for the needle
+    search_file(wa->needle, path);
+        
+    // Free the duplicated string
     free(path);
   }
   return NULL;
@@ -114,6 +121,7 @@ int main(int argc, char * const *argv) {
   }
 
   FTSENT *p;
+  int file_count = 0;
   while ((p = fts_read(ftsp)) != NULL) {
     switch (p->fts_info) {
     case FTS_D:
@@ -139,7 +147,6 @@ int main(int argc, char * const *argv) {
     }
   }
   free(threads);
-
   return 0;
 }
 

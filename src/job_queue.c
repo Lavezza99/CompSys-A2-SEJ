@@ -26,15 +26,16 @@ int job_queue_init(struct job_queue *job_queue, int capacity) {
 int job_queue_destroy(struct job_queue *job_queue) {
   pthread_mutex_lock(&job_queue->mutex);
 
-  // wait until queue is empty
-  while (job_queue->size > 0)
-    pthread_cond_wait(&job_queue->not_empty, &job_queue->mutex);
-
+  // Set destroyed flag first
   job_queue->destroyed = 1;
+  
+  // Wake up all threads waiting on push or pop
   pthread_cond_broadcast(&job_queue->not_full);
   pthread_cond_broadcast(&job_queue->not_empty);
+  
   pthread_mutex_unlock(&job_queue->mutex);
 
+  // Destroy mutex and condition variables
   pthread_mutex_destroy(&job_queue->mutex);
   pthread_cond_destroy(&job_queue->not_full);
   pthread_cond_destroy(&job_queue->not_empty);
