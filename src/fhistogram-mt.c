@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -17,8 +18,8 @@
 
 typedef struct {
   struct job_queue *jq;
-  int (*global_hist)[8];           // pointer to the 8-bin global histogram
-  pthread_mutex_t *merge_lock;
+  int (*global_hist)[8];
+  pthread_mutex_t *hist_lock;
 } worker_arg_t;
 
 static void* worker(void *arg) {
@@ -27,29 +28,42 @@ static void* worker(void *arg) {
   for (;;) {
     char *path = NULL;
     if (job_queue_pop(wa->jq, (void**)&path) != 0) {
-      break; // queue destroyed & empty => exit
+      break;
     }
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-      fprintf(stderr, "fhistogram-mt: cannot open %s\n", path);
+      fflush(stdout);
+      warn("failed to open %s", path);
       free(path);
       continue;
     }
 
     int local[8] = {0};
-    unsigned char buf[1<<15];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-      for (size_t i = 0; i < n; ++i) {
-        update_histogram(local, buf[i]);  // <-- use skeleton helper
+    int bytes_since_update = 0;
+    unsigned char c;
+    
+    while (fread(&c, sizeof(c), 1, f) == 1) {
+      update_histogram(local, c);
+      bytes_since_update++;
+      
+      // Update global histogram periodically (every 100,000 bytes)
+      if (bytes_since_update >= 100000) {
+        pthread_mutex_lock(wa->hist_lock);
+        merge_histogram(local, *wa->global_hist);
+        print_histogram(*wa->global_hist);
+        pthread_mutex_unlock(wa->hist_lock);
+        bytes_since_update = 0;
       }
     }
+    
     fclose(f);
 
-    assert(pthread_mutex_lock(wa->merge_lock) == 0);
-    merge_histogram(local, *wa->global_hist);            // <-- use helper
-    assert(pthread_mutex_unlock(wa->merge_lock) == 0);
+    // Final merge for remaining bytes
+    pthread_mutex_lock(wa->hist_lock);
+    merge_histogram(local, *wa->global_hist);
+    print_histogram(*wa->global_hist);
+    pthread_mutex_unlock(wa->hist_lock);
 
     free(path);
   }
@@ -63,7 +77,7 @@ int main(int argc, char * const *argv) {
   }
 
   int num_threads = 1;
-  char * const *paths = &argv[1];
+  char * const *paths;
 
   if (argc > 3 && strcmp(argv[1], "-n") == 0) {
     num_threads = atoi(argv[2]);
@@ -80,13 +94,18 @@ int main(int argc, char * const *argv) {
     err(1, "job_queue_init() failed");
   }
 
-  int global_hist[8] = {0};                             // 8-bin histogram per skeleton
-  pthread_mutex_t merge_lock = PTHREAD_MUTEX_INITIALIZER;
+  int global_hist[8] = {0};
+  pthread_mutex_t hist_lock = PTHREAD_MUTEX_INITIALIZER;
 
   pthread_t *threads = calloc(num_threads, sizeof(pthread_t));
   if (!threads) err(1, "calloc threads failed");
 
-  worker_arg_t warg = { .jq = &jq, .global_hist = &global_hist, .merge_lock = &merge_lock };
+  worker_arg_t warg = { 
+    .jq = &jq, 
+    .global_hist = &global_hist, 
+    .hist_lock = &hist_lock 
+  };
+  
   for (int i = 0; i < num_threads; i++) {
     if (pthread_create(&threads[i], NULL, &worker, &warg) != 0) {
       err(1, "pthread_create() failed");
@@ -103,28 +122,30 @@ int main(int argc, char * const *argv) {
   FTSENT *p;
   while ((p = fts_read(ftsp)) != NULL) {
     switch (p->fts_info) {
-      case FTS_D: break;
+      case FTS_D: 
+        break;
       case FTS_F:
         if (job_queue_push(&jq, strdup(p->fts_path)) != 0) {
           err(1, "job_queue_push() failed");
         }
         break;
-      default: break;
+      default: 
+        break;
     }
   }
   fts_close(ftsp);
 
   job_queue_destroy(&jq);
+  
   for (int i = 0; i < num_threads; i++) {
     if (pthread_join(threads[i], NULL) != 0) {
       err(1, "pthread_join() failed");
     }
   }
   free(threads);
+  
+  pthread_mutex_destroy(&hist_lock);
 
-  print_histogram(global_hist);                         // <-- use helper
-  move_lines(9);                                        // keep skeleton call
+  move_lines(9);
   return 0;
 }
-
-
